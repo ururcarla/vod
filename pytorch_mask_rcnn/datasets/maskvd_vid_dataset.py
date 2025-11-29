@@ -152,7 +152,6 @@ class MaskVDVIDDataset(GeneralizedDataset):
     def _is_valid_frame(self, frame: Dict) -> bool:
         return len(frame["labels"]) == 1
 
-    @staticmethod
     def _locate_split_name(self, split: str) -> str:
         candidates = []
         if split in SPLIT_ALIASES:
