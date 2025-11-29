@@ -1,47 +1,16 @@
 import json
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image
 import torch
+from pycocotools.coco import COCO
 
 from .generalized_dataset import GeneralizedDataset
 
 
-TARGET_CLASSES = (
-    "airplane",
-    "antelope",
-    "bear",
-    "bicycle",
-    "bird",
-    "bus",
-    "car",
-    "cattle",
-    "dog",
-    "domestic_cat",
-    "elephant",
-    "fox",
-    "giant_panda",
-    "hamster",
-    "horse",
-    "lion",
-    "lizard",
-    "monkey",
-    "motorcycle",
-    "rabbit",
-    "red_panda",
-    "sheep",
-    "snake",
-    "squirrel",
-    "tiger",
-    "train",
-    "turtle",
-    "watercraft",
-    "whale",
-    "zebra",
-)
-DEFAULT_ALLOWED_IDS = (9, 13, 14)  # consistent with ImagenetVIDDataset
+TARGET_CATEGORY_IDS = (9, 13, 14)
+TARGET_CLASS_NAMES = {9: "dog", 13: "giant_panda", 14: "hamster"}
 
 SPLIT_ALIASES = {
     "train": "vid_train",
@@ -57,177 +26,252 @@ SPLIT_ALIASES = {
 
 class MaskVDVIDDataset(GeneralizedDataset):
     """
-    Read MaskVD's vid_data split and output samples identical to ImagenetVIDDataset:
-    - each __getitem__ returns (image_tensor, target_dict)
-    - targets contain keys: boxes, labels, video_id, masks(None)
-    - only frames with a single object of classes {dog, giant_panda, hamster} are kept,
-      and videos are truncated/padded to clip_length frames to match the original logic.
+    读取 MaskVD 官方提供的 vid_data.tar 解压目录，并生成与 ImagenetVIDDataset
+    完全一致的 (image, target)。
     """
 
     def __init__(
         self,
         data_dir,
         split,
-        train=False,
-        clip_length=60,
-        allowed_categories=DEFAULT_ALLOWED_IDS,
+        train: bool = False,
+        clip_length: int = 60,
+        allowed_categories: Sequence[int] = TARGET_CATEGORY_IDS,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
-        self.clip_length = clip_length
         self.train = train
+        self.clip_length = clip_length
 
         self.allowed_categories = tuple(allowed_categories)
-        self.classes = {
-            idx + 1: TARGET_CLASSES[cat_id - 1]
-            for idx, cat_id in enumerate(self.allowed_categories)
-        }
-        self.label_mapping = {
-            cat_id: idx + 1 for idx, cat_id in enumerate(self.allowed_categories)
-        }
+        self.label_mapping = {cat_id: idx + 1 for idx, cat_id in enumerate(self.allowed_categories)}
+        self.classes = {idx + 1: TARGET_CLASS_NAMES[cat_id] for idx, cat_id in enumerate(self.allowed_categories)}
 
-        self.split_dir = self._locate_split(split)
-        ann_file = self.split_dir / "labels.json"
-        self.frame_root = self.split_dir / "frames"
-        with ann_file.open("r") as f:
-            json_data = json.load(f)
+        self.split_name = self._normalize_split(split)
+        self.split_dir = self._resolve_split_dir(self.split_name)
+        self.ann_file = self._resolve_annotation_file(self.split_name)
+        self.frame_roots = self._build_frame_roots(self.split_dir)
 
-        self.samples: Dict[str, Dict] = {}
-        self.video_name_to_idx: Dict[str, int] = {}
+        self.coco = COCO(str(self.ann_file))
+        self.image_path_cache: Dict[int, Path] = {}
 
-        frames = self._build_frames(json_data)
-        self.ids = self._build_ids(frames)
+        self.ids = self._select_ids()
 
         if train:
-            checked_id_file = self.data_dir / f"checked_{self.split_dir.name}.txt"
-            if not checked_id_file.exists():
-                self._aspect_ratios = [self._aspect_ratio(self.samples[idx]) for idx in self.ids]
-            self.check_dataset(str(checked_id_file))
+            checked_file = self.data_dir / f"checked_{self.split_name}.txt"
+            if not checked_file.exists():
+                self._aspect_ratios = [self._estimate_aspect_ratio(img_id) for img_id in self.ids]
+            self.check_dataset(str(checked_file))
 
-    def _locate_split(self, split: str) -> Path:
-        candidates = []
-        if split in SPLIT_ALIASES:
-            candidates.append(SPLIT_ALIASES[split])
-        candidates.append(split)
+    # ------------------------------------------------------------------ #
+    # 构建 index
+    # ------------------------------------------------------------------ #
 
-        tried = []
-        for cand in dict.fromkeys(candidates):
-            candidate_dir = self.data_dir / cand
-            tried.append(candidate_dir)
-            if candidate_dir.is_dir() and (candidate_dir / "labels.json").exists():
-                return candidate_dir
+    def _normalize_split(self, split: str) -> str:
+        return SPLIT_ALIASES.get(split, split)
 
-        available = [p.name for p in self.data_dir.iterdir() if p.is_dir()]
-        raise FileNotFoundError(
-            f"Cannot find split '{split}'. Tried {[str(p) for p in tried]}. "
-            f"Available splits under {self.data_dir}: {available}"
-        )
+    def _resolve_split_dir(self, split_name: str) -> Path:
+        candidates = [
+            self.data_dir / split_name,
+            self.data_dir,
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        return self.data_dir
 
-    def _build_frames(self, json_data) -> Dict[int, Dict]:
-        frames: Dict[int, Dict] = {}
-        for img in json_data["images"]:
-            video_id, frame_number = self._parse_filename(img["file_name"])
-            path = self.frame_root / video_id / f"{frame_number}.jpg"
-            frames[img["id"]] = {
-                "image_id": img["id"],
-                "video_id": video_id,
-                "frame_number": int(frame_number),
-                "path": path,
-                "width": img.get("width", 1),
-                "height": img.get("height", 1),
-                "boxes": [],
-                "labels": [],
-            }
+    def _resolve_annotation_file(self, split_name: str) -> Path:
+        candidates = [
+            self.data_dir / split_name / "labels.json",
+            self.data_dir / "annotations" / f"{split_name}.json",
+            self.data_dir / "annotations" / f"{self.split}.json",
+        ]
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        raise FileNotFoundError(f"未找到 {split_name} 标注: {[str(c) for c in candidates]}")
 
-        for ann in json_data["annotations"]:
+    def _build_frame_roots(self, split_dir: Path) -> List[Path]:
+        roots = []
+        candidates = [
+            split_dir / "frames",
+            split_dir,
+            self.data_dir,
+            self.data_dir.parent / "ILSVRC2015" / "Data" / "VID",
+            self.data_dir.parent,
+        ]
+        seen = set()
+        for cand in candidates:
+            if cand is None:
+                continue
+            cand = cand.resolve()
+            if cand.exists() and cand not in seen:
+                roots.append(cand)
+                seen.add(cand)
+        return roots or [self.data_dir]
+
+    def _select_ids(self) -> List[str]:
+        ids: List[str] = []
+        sorted_ids = sorted(self.coco.imgs.keys(), key=int)
+        prev_video = None
+        count = 0
+
+        for img_id in sorted_ids:
+            labels, video_id = self._labels_and_video(img_id)
+            if not self._frame_valid(labels, video_id):
+                continue
+
+            if prev_video is None or video_id != prev_video:
+                if prev_video is not None:
+                    self._pad_previous(ids, count)
+                prev_video = video_id
+                count = 0
+
+            if count >= self.clip_length:
+                continue
+
+            ids.append(str(img_id))
+            count += 1
+
+        self._pad_previous(ids, count)
+        return ids
+
+    def _pad_previous(self, ids: List[str], count: int) -> None:
+        if count == 0 or not ids:
+            return
+        last_id = ids[-1]
+        while count < self.clip_length:
+            ids.append(last_id)
+            count += 1
+
+    def _labels_and_video(self, img_id: int) -> Tuple[List[int], Optional[int]]:
+        ann_ids = self.coco.getAnnIds(imgIds=[img_id])
+        anns = self.coco.loadAnns(ann_ids)
+        labels = [ann["category_id"] for ann in anns]
+        video_id = anns[0].get("video_id") if anns else None
+        return labels, video_id
+
+    def _frame_valid(self, labels: List[int], video_id: Optional[int]) -> bool:
+        if video_id is None:
+            return False
+        if len(labels) != 1:
+            return False
+        return labels[0] in self.allowed_categories
+
+    def _estimate_aspect_ratio(self, img_id: str) -> float:
+        info = self.coco.imgs[int(img_id)]
+        width = info.get("width", 1)
+        height = info.get("height", 1)
+        return width / height if height else 1.0
+
+    # ------------------------------------------------------------------ #
+    # Dataset API
+    # ------------------------------------------------------------------ #
+
+    def get_image(self, img_id):
+        img_id = int(img_id)
+        path = self._resolve_image_path(img_id)
+        image = Image.open(path)
+        return image.convert("RGB")
+
+    def get_target(self, img_id):
+        img_id = int(img_id)
+        ann_ids = self.coco.getAnnIds(imgIds=[img_id])
+        anns = self.coco.loadAnns(ann_ids)
+
+        boxes = []
+        labels = []
+        videos = []
+        for ann in anns:
             cat_id = ann["category_id"]
             if cat_id not in self.allowed_categories:
                 continue
-            frame = frames.get(ann["image_id"])
-            if frame is None:
-                continue
-            frame["boxes"].append(ann["bbox"])
-            frame["labels"].append(self.label_mapping[cat_id])
+            boxes.append(ann["bbox"])
+            labels.append(self.label_mapping[cat_id])
+            videos.append(ann.get("video_id", -1))
 
-        return frames
+        if boxes:
+            boxes_tensor = torch.tensor(boxes, dtype=torch.float32)
+            boxes_tensor = self._to_xyxy(boxes_tensor)
+        else:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
 
-    def _build_ids(self, frames: Dict[int, Dict]) -> List[str]:
-        ids: List[str] = []
-        videos: Dict[str, List[Dict]] = defaultdict(list)
-        for frame in frames.values():
-            videos[frame["video_id"]].append(frame)
+        labels_tensor = torch.tensor(labels, dtype=torch.int64)
+        if videos:
+            video_tensor = torch.tensor(videos, dtype=torch.int64)
+        else:
+            video_tensor = torch.tensor([-1], dtype=torch.int64)
 
-        for video_id in sorted(videos.keys()):
-            frames_in_video = sorted(videos[video_id], key=lambda f: f["frame_number"])
-            valid_frames = [frame for frame in frames_in_video if self._is_valid_frame(frame)]
-            if not valid_frames:
-                continue
-
-            frame_count = 0
-            for frame in valid_frames:
-                if frame_count >= self.clip_length:
-                    break
-                sample_id = str(frame["image_id"])
-                self.samples[sample_id] = frame
-                ids.append(sample_id)
-                frame_count += 1
-
-                if video_id not in self.video_name_to_idx:
-                    self.video_name_to_idx[video_id] = len(self.video_name_to_idx) + 1
-
-            last_id = ids[-1]
-            while frame_count < self.clip_length:
-                ids.append(last_id)
-                frame_count += 1
-
-        return ids
+        target = dict(
+            image_id=torch.tensor([img_id]),
+            boxes=boxes_tensor,
+            labels=labels_tensor,
+            video_id=video_tensor,
+            masks=None,
+        )
+        return target
 
     @staticmethod
-    def _parse_filename(file_name: str) -> Tuple[str, str]:
-        stem = Path(file_name).stem
-        video_id, frame_number = stem.split("_")[-2:]
-        return video_id, frame_number
-
-    @staticmethod
-    def _aspect_ratio(sample: Dict) -> float:
-        height = sample.get("height", 1)
-        width = sample.get("width", 1)
-        return width / height if height else 1.0
-
-    @staticmethod
-    def convert_to_xyxy(boxes):
+    def _to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
         if boxes.numel() == 0:
             return boxes
         x, y, w, h = boxes.T
         return torch.stack((x, y, x + w, y + h), dim=1)
 
-    def _is_valid_frame(self, frame: Dict) -> bool:
-        return len(frame["labels"]) == 1
+    # ------------------------------------------------------------------ #
+    # image path resolution
+    # ------------------------------------------------------------------ #
 
-    def get_image(self, img_id):
-        sample = self.samples[str(int(img_id))]
-        image = Image.open(sample["path"])
-        return image.convert("RGB")
+    def _resolve_image_path(self, img_id: int) -> Path:
+        if img_id in self.image_path_cache:
+            return self.image_path_cache[img_id]
 
-    def get_target(self, img_id):
-        sample = self.samples[str(int(img_id))]
+        img_info = self.coco.imgs[img_id]
+        file_name = img_info.get("file_name", "")
+        video_id, frame_name = self._parse_video_frame(file_name)
 
-        boxes = torch.tensor(sample["boxes"], dtype=torch.float32)
-        boxes = self.convert_to_xyxy(boxes)
-        labels = torch.tensor(sample["labels"], dtype=torch.int64)
+        candidates = []
+        candidates.extend(self._video_frame_candidates(video_id, frame_name))
 
-        video_idx = self.video_name_to_idx.setdefault(
-            sample["video_id"], len(self.video_name_to_idx) + 1
-        )
-        video_tensor = torch.full((len(labels),), video_idx, dtype=torch.int64)
+        rel = Path(file_name)
+        candidates.append(rel)
+        candidates.extend(root / rel for root in self.frame_roots)
+        candidates.extend(root / rel.name for root in self.frame_roots)
 
-        target = dict(
-            image_id=torch.tensor([int(sample["image_id"])]),
-            boxes=boxes,
-            labels=labels,
-            video_id=video_tensor,
-            masks=None,
-        )
-        return target
+        for cand in candidates:
+            cand_path = cand if isinstance(cand, Path) else Path(cand)
+            if cand_path.exists():
+                self.image_path_cache[img_id] = cand_path
+                return cand_path
+
+        raise FileNotFoundError(f"无法找到图像 {file_name}，已尝试 {len(candidates)} 条路径。")
+
+    def _video_frame_candidates(self, video_id: Optional[str], frame_name: Optional[str]) -> List[Path]:
+        if not video_id or not frame_name:
+            return []
+        variants = {
+            frame_name,
+            frame_name.replace(".JPEG", ".jpg"),
+            frame_name.replace(".jpg", ".JPEG"),
+            frame_name.replace(".jpeg", ".jpg"),
+        }
+        candidates = []
+        for root in self.frame_roots:
+            for variant in variants:
+                candidates.append(root / "frames" / video_id / variant)
+                candidates.append(root / video_id / variant)
+                candidates.append(root / f"{video_id}_{variant}")
+        return candidates
+
+    @staticmethod
+    def _parse_video_frame(file_name: str) -> Tuple[Optional[str], Optional[str]]:
+        stem = Path(file_name).stem
+        parts = stem.split("_")
+        if len(parts) < 2:
+            return None, None
+        video_id = parts[-2]
+        frame_id = parts[-1]
+        ext = Path(file_name).suffix or ".jpg"
+        return video_id, f"{frame_id}{ext}"
 
