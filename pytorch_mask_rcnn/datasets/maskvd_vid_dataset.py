@@ -17,6 +17,7 @@ SPLIT_ALIASES = {
     "vid_val": "vid_val",
     "minival": "vid_minival",
     "vid_minival": "vid_minival",
+    "vid_minival_v1": "vid_minival",
     "det_train": "det_train",
 }
 
@@ -33,7 +34,7 @@ class MaskVDVIDDataset(GeneralizedDataset):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
-        self.split_name = self._resolve_split(split)
+        self.split_name = self._locate_split_name(split)
         self.train = train
         self.clip_length = clip_length
         self.allowed_categories = tuple(allowed_categories)
@@ -43,11 +44,17 @@ class MaskVDVIDDataset(GeneralizedDataset):
 
         ann_file = self.data_dir / self.split_name / "labels.json"
         if not ann_file.exists():
-            raise FileNotFoundError(f"Cannot find labels.json at {ann_file}")
+            available = ", ".join(self._list_splits())
+            raise FileNotFoundError(
+                f"Cannot find labels.json at {ann_file}. Available splits: {available}"
+            )
 
         self.frame_root = self.data_dir / self.split_name / "frames"
         if not self.frame_root.exists():
-            raise FileNotFoundError(f"Cannot find frames directory at {self.frame_root}")
+            available = ", ".join(self._list_splits())
+            raise FileNotFoundError(
+                f"Cannot find frames directory at {self.frame_root}. Available splits: {available}"
+            )
 
         with ann_file.open("r") as f:
             json_data = json.load(f)
@@ -146,10 +153,31 @@ class MaskVDVIDDataset(GeneralizedDataset):
         return len(frame["labels"]) == 1
 
     @staticmethod
-    def _resolve_split(split: str) -> str:
+    def _locate_split_name(self, split: str) -> str:
+        candidates = []
         if split in SPLIT_ALIASES:
-            return SPLIT_ALIASES[split]
-        raise ValueError(f"Unsupported split '{split}', expected one of {list(SPLIT_ALIASES.keys())}")
+            candidates.append(SPLIT_ALIASES[split])
+        candidates.append(split)
+
+        for cand in dict.fromkeys(candidates):  # preserve order, drop duplicates
+            ann_file = self.data_dir / cand / "labels.json"
+            if ann_file.exists():
+                return cand
+
+        available = ", ".join(self._list_splits())
+        raise FileNotFoundError(
+            f"Cannot find split directory for '{split}'. "
+            f"Tried {candidates}. Available splits: {available}"
+        )
+
+    def _list_splits(self) -> List[str]:
+        splits = []
+        if not self.data_dir.exists():
+            return splits
+        for child in self.data_dir.iterdir():
+            if child.is_dir():
+                splits.append(child.name)
+        return splits
 
     @staticmethod
     def _aspect_ratio(sample: Dict) -> float:
