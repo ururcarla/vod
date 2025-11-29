@@ -42,6 +42,16 @@ CLASSES = (
 )
 COCO_CATEGORY_IDS = tuple(range(1, len(CLASSES) + 1))
 
+SPLIT_MAPPING = {
+    "train": "vid_train",
+    "val": "vid_val",
+    "test": "vid_val",
+    "vid_train": "vid_train",
+    "vid_val": "vid_val",
+    "vid_minival": "vid_minival",
+    "det_train": "det_train",
+}
+
 
 class MaskVDVIDDataset(GeneralizedDataset):
     """
@@ -54,15 +64,22 @@ class MaskVDVIDDataset(GeneralizedDataset):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
+        self.maskvd_split = SPLIT_MAPPING.get(split, split)
         self.train = train
         self.clip_length = clip_length
 
-        self.frames_dir = self.data_dir / split / "frames"
-        self.ann_file = self.data_dir / split / "labels.json"
+        self.frames_dir = self.data_dir / self.maskvd_split / "frames"
+        ann_candidates = [
+            self.data_dir / self.maskvd_split / "labels.json",
+            self.data_dir / "annotations" / f"{self.maskvd_split}.json",
+        ]
+        self.ann_file = next((p for p in ann_candidates if p.exists()), None)
+        if self.ann_file is None:
+            raise FileNotFoundError(
+                f"Annotation file not found under {ann_candidates[0]} or {ann_candidates[1]}"
+            )
         if not self.frames_dir.exists():
             raise FileNotFoundError(f"Frames directory not found: {self.frames_dir}")
-        if not self.ann_file.exists():
-            raise FileNotFoundError(f"Annotation file not found: {self.ann_file}")
 
         with self.ann_file.open("r") as f:
             json_data = json.load(f)
