@@ -57,12 +57,7 @@ class MaskVDVIDDataset(GeneralizedDataset):
         self.image_path_cache: Dict[int, Path] = {}
 
         self.ids = self._select_ids()
-
-        if train:
-            checked_file = self.data_dir / f"checked_{self.split_name}.txt"
-            if not checked_file.exists():
-                self._aspect_ratios = [self._estimate_aspect_ratio(img_id) for img_id in self.ids]
-            self.check_dataset(str(checked_file))
+        self.aspect_ratios = [self._estimate_aspect_ratio(img_id) for img_id in self.ids]
 
     # ------------------------------------------------------------------ #
     # 构建 index
