@@ -60,13 +60,14 @@ class MaskVDVIDDataset(GeneralizedDataset):
     rest of the project can reuse it directly.
     """
 
-    def __init__(self, data_dir, split, train=False, clip_length=60):
+    def __init__(self, data_dir, split, train=False, clip_length=60, single_instance=False):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
         self.maskvd_split = SPLIT_MAPPING.get(split, split)
         self.train = train
         self.clip_length = clip_length
+        self.single_instance = single_instance
 
         self.frames_dir = self.data_dir / self.maskvd_split / "frames"
         ann_candidates = [
@@ -90,6 +91,8 @@ class MaskVDVIDDataset(GeneralizedDataset):
         }
 
         frames = self._parse_frames(json_data)
+        if self.single_instance:
+            self._keep_single_instance(frames)
         video_segments = self._group_by_video(frames)
 
         self.samples = {}
@@ -165,6 +168,15 @@ class MaskVDVIDDataset(GeneralizedDataset):
 
         return frames
 
+    def _keep_single_instance(self, frames):
+        for sample in frames.values():
+            if len(sample["labels"]) <= 1:
+                continue
+            areas = [bbox[2] * bbox[3] for bbox in sample["boxes"]]
+            keep_idx = areas.index(max(areas))
+            sample["boxes"] = [sample["boxes"][keep_idx]]
+            sample["labels"] = [sample["labels"][keep_idx]]
+
     def _group_by_video(self, frames):
         video_dict = defaultdict(list)
         for frame in frames.values():
@@ -203,11 +215,14 @@ class MaskVDVIDDataset(GeneralizedDataset):
         x, y, w, h = boxes.T
         return torch.stack((x, y, x + w, y + h), dim=1)
 
-    @staticmethod
-    def _is_valid_frame(frame):
-        if len(frame["labels"]) != 1:
-            return False
-        return frame["labels"][0] in COCO_CATEGORY_IDS
+    def _is_valid_frame(self, frame):
+        if self.single_instance:
+            if len(frame["labels"]) != 1:
+                return False
+            return frame["labels"][0] in COCO_CATEGORY_IDS
+        return len(frame["labels"]) > 0 and all(
+            label in COCO_CATEGORY_IDS for label in frame["labels"]
+        )
 
     @staticmethod
     def _aspect_ratio_from_sample(sample):
