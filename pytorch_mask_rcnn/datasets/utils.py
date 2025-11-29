@@ -9,7 +9,7 @@ __all__ = ["datasets", "collate_wrapper"]
 
 def datasets(ds, *args, **kwargs):
     ds = ds.lower()
-    choice = ["voc", "coco", "movmnist", "imagenetvid", "maskvd"]
+    choice = ["voc", "coco", "movmnist", "imagenetvid", "maskvd", "maskvd_single"]
     if ds == choice[0]:
         return VOCDataset(*args, **kwargs)
     if ds == choice[1]:
@@ -19,6 +19,9 @@ def datasets(ds, *args, **kwargs):
     if ds == choice[3]:
         return ImagenetVIDDataset(*args, **kwargs)
     if ds == choice[4]:
+        return MaskVDVIDDataset(*args, **kwargs)
+    if ds == choice[5]:
+        kwargs.setdefault("single_instance", True)
         return MaskVDVIDDataset(*args, **kwargs)
     else:
         raise ValueError("'ds' must be in '{}', but got '{}'".format(choice, ds))
