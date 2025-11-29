@@ -10,6 +10,15 @@ from .generalized_dataset import GeneralizedDataset
 
 CLASSES = ("dog", "giant_panda", "hamster")
 ALLOWED_CATEGORY_IDS = (9, 13, 14)
+SPLIT_ALIASES = {
+    "train": "vid_train",
+    "vid_train": "vid_train",
+    "val": "vid_val",
+    "vid_val": "vid_val",
+    "minival": "vid_minival",
+    "vid_minival": "vid_minival",
+    "det_train": "det_train",
+}
 
 
 class MaskVDVIDDataset(GeneralizedDataset):
@@ -24,6 +33,7 @@ class MaskVDVIDDataset(GeneralizedDataset):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
+        self.split_name = self._resolve_split(split)
         self.train = train
         self.clip_length = clip_length
         self.allowed_categories = tuple(allowed_categories)
@@ -31,11 +41,11 @@ class MaskVDVIDDataset(GeneralizedDataset):
         self.classes = {i: name for i, name in enumerate(CLASSES, 1)}
         self.label_mapping = {cat_id: i + 1 for i, cat_id in enumerate(self.allowed_categories)}
 
-        ann_file = self.data_dir / split / "labels.json"
+        ann_file = self.data_dir / self.split_name / "labels.json"
         if not ann_file.exists():
             raise FileNotFoundError(f"Cannot find labels.json at {ann_file}")
 
-        self.frame_root = self.data_dir / split / "frames"
+        self.frame_root = self.data_dir / self.split_name / "frames"
         if not self.frame_root.exists():
             raise FileNotFoundError(f"Cannot find frames directory at {self.frame_root}")
 
@@ -49,7 +59,7 @@ class MaskVDVIDDataset(GeneralizedDataset):
         self.ids = self._build_ids(frames)
 
         if train:
-            checked_id_file = self.data_dir / f"checked_{split}.txt"
+            checked_id_file = self.data_dir / f"checked_{self.split_name}.txt"
             if not checked_id_file.exists():
                 self._aspect_ratios = [self._aspect_ratio(self.samples[idx]) for idx in self.ids]
             self.check_dataset(str(checked_id_file))
@@ -134,6 +144,12 @@ class MaskVDVIDDataset(GeneralizedDataset):
 
     def _is_valid_frame(self, frame: Dict) -> bool:
         return len(frame["labels"]) == 1
+
+    @staticmethod
+    def _resolve_split(split: str) -> str:
+        if split in SPLIT_ALIASES:
+            return SPLIT_ALIASES[split]
+        raise ValueError(f"Unsupported split '{split}', expected one of {list(SPLIT_ALIASES.keys())}")
 
     @staticmethod
     def _aspect_ratio(sample: Dict) -> float:
