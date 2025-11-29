@@ -1,4 +1,5 @@
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -8,8 +9,40 @@ import torch
 from .generalized_dataset import GeneralizedDataset
 
 
-CLASSES = ("dog", "giant_panda", "hamster")
-ALLOWED_CATEGORY_IDS = (9, 13, 14)
+TARGET_CLASSES = (
+    "airplane",
+    "antelope",
+    "bear",
+    "bicycle",
+    "bird",
+    "bus",
+    "car",
+    "cattle",
+    "dog",
+    "domestic_cat",
+    "elephant",
+    "fox",
+    "giant_panda",
+    "hamster",
+    "horse",
+    "lion",
+    "lizard",
+    "monkey",
+    "motorcycle",
+    "rabbit",
+    "red_panda",
+    "sheep",
+    "snake",
+    "squirrel",
+    "tiger",
+    "train",
+    "turtle",
+    "watercraft",
+    "whale",
+    "zebra",
+)
+DEFAULT_ALLOWED_IDS = (9, 13, 14)  # consistent with ImagenetVIDDataset
+
 SPLIT_ALIASES = {
     "train": "vid_train",
     "vid_train": "vid_train",
@@ -24,38 +57,39 @@ SPLIT_ALIASES = {
 
 class MaskVDVIDDataset(GeneralizedDataset):
     """
-    Dataset wrapper that reads ImageNet-VID data prepared with MaskVD's
-    vid_data format (frames/ + labels.json) and exposes the same interface
-    as ImagenetVIDDataset so that the rest of the project can remain
-    unchanged.
+    Read MaskVD's vid_data split and output samples identical to ImagenetVIDDataset:
+    - each __getitem__ returns (image_tensor, target_dict)
+    - targets contain keys: boxes, labels, video_id, masks(None)
+    - only frames with a single object of classes {dog, giant_panda, hamster} are kept,
+      and videos are truncated/padded to clip_length frames to match the original logic.
     """
 
-    def __init__(self, data_dir, split, train=False, clip_length=60, allowed_categories=ALLOWED_CATEGORY_IDS):
+    def __init__(
+        self,
+        data_dir,
+        split,
+        train=False,
+        clip_length=60,
+        allowed_categories=DEFAULT_ALLOWED_IDS,
+    ):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
-        self.split_name = self._locate_split_name(split)
-        self.train = train
         self.clip_length = clip_length
+        self.train = train
+
         self.allowed_categories = tuple(allowed_categories)
+        self.classes = {
+            idx + 1: TARGET_CLASSES[cat_id - 1]
+            for idx, cat_id in enumerate(self.allowed_categories)
+        }
+        self.label_mapping = {
+            cat_id: idx + 1 for idx, cat_id in enumerate(self.allowed_categories)
+        }
 
-        self.classes = {i: name for i, name in enumerate(CLASSES, 1)}
-        self.label_mapping = {cat_id: i + 1 for i, cat_id in enumerate(self.allowed_categories)}
-
-        ann_file = self.data_dir / self.split_name / "labels.json"
-        if not ann_file.exists():
-            available = ", ".join(self._list_splits())
-            raise FileNotFoundError(
-                f"Cannot find labels.json at {ann_file}. Available splits: {available}"
-            )
-
-        self.frame_root = self.data_dir / self.split_name / "frames"
-        if not self.frame_root.exists():
-            available = ", ".join(self._list_splits())
-            raise FileNotFoundError(
-                f"Cannot find frames directory at {self.frame_root}. Available splits: {available}"
-            )
-
+        self.split_dir = self._locate_split(split)
+        ann_file = self.split_dir / "labels.json"
+        self.frame_root = self.split_dir / "frames"
         with ann_file.open("r") as f:
             json_data = json.load(f)
 
@@ -66,21 +100,40 @@ class MaskVDVIDDataset(GeneralizedDataset):
         self.ids = self._build_ids(frames)
 
         if train:
-            checked_id_file = self.data_dir / f"checked_{self.split_name}.txt"
+            checked_id_file = self.data_dir / f"checked_{self.split_dir.name}.txt"
             if not checked_id_file.exists():
                 self._aspect_ratios = [self._aspect_ratio(self.samples[idx]) for idx in self.ids]
             self.check_dataset(str(checked_id_file))
 
+    def _locate_split(self, split: str) -> Path:
+        candidates = []
+        if split in SPLIT_ALIASES:
+            candidates.append(SPLIT_ALIASES[split])
+        candidates.append(split)
+
+        tried = []
+        for cand in dict.fromkeys(candidates):
+            candidate_dir = self.data_dir / cand
+            tried.append(candidate_dir)
+            if candidate_dir.is_dir() and (candidate_dir / "labels.json").exists():
+                return candidate_dir
+
+        available = [p.name for p in self.data_dir.iterdir() if p.is_dir()]
+        raise FileNotFoundError(
+            f"Cannot find split '{split}'. Tried {[str(p) for p in tried]}. "
+            f"Available splits under {self.data_dir}: {available}"
+        )
+
     def _build_frames(self, json_data) -> Dict[int, Dict]:
         frames: Dict[int, Dict] = {}
         for img in json_data["images"]:
-            video_id, frame_number = self._parse_maskvd_filename(img["file_name"])
-            frame_path = self.frame_root / video_id / f"{frame_number}.jpg"
+            video_id, frame_number = self._parse_filename(img["file_name"])
+            path = self.frame_root / video_id / f"{frame_number}.jpg"
             frames[img["id"]] = {
                 "image_id": img["id"],
                 "video_id": video_id,
                 "frame_number": int(frame_number),
-                "path": frame_path,
+                "path": path,
                 "width": img.get("width", 1),
                 "height": img.get("height", 1),
                 "boxes": [],
@@ -88,59 +141,59 @@ class MaskVDVIDDataset(GeneralizedDataset):
             }
 
         for ann in json_data["annotations"]:
-            if ann["category_id"] not in self.allowed_categories:
+            cat_id = ann["category_id"]
+            if cat_id not in self.allowed_categories:
                 continue
-            if ann["image_id"] not in frames:
+            frame = frames.get(ann["image_id"])
+            if frame is None:
                 continue
-            frames[ann["image_id"]]["boxes"].append(ann["bbox"])
-            frames[ann["image_id"]]["labels"].append(ann["category_id"])
+            frame["boxes"].append(ann["bbox"])
+            frame["labels"].append(self.label_mapping[cat_id])
 
         return frames
 
     def _build_ids(self, frames: Dict[int, Dict]) -> List[str]:
         ids: List[str] = []
-        count = 0
-        prev_video = None
+        videos: Dict[str, List[Dict]] = defaultdict(list)
+        for frame in frames.values():
+            videos[frame["video_id"]].append(frame)
 
-        for frame in sorted(frames.values(), key=lambda f: (f["video_id"], f["frame_number"])):
-            if not self._is_valid_frame(frame):
+        for video_id in sorted(videos.keys()):
+            frames_in_video = sorted(videos[video_id], key=lambda f: f["frame_number"])
+            valid_frames = [frame for frame in frames_in_video if self._is_valid_frame(frame)]
+            if not valid_frames:
                 continue
 
-            video_id = frame["video_id"]
-            if prev_video is None:
-                prev_video = video_id
-            elif video_id != prev_video:
-                count = self._finalize_video(ids, count)
-                prev_video = video_id
+            frame_count = 0
+            for frame in valid_frames:
+                if frame_count >= self.clip_length:
+                    break
+                sample_id = str(frame["image_id"])
+                self.samples[sample_id] = frame
+                ids.append(sample_id)
+                frame_count += 1
 
-            if count >= self.clip_length:
-                continue
+                if video_id not in self.video_name_to_idx:
+                    self.video_name_to_idx[video_id] = len(self.video_name_to_idx) + 1
 
-            sample_id = str(frame["image_id"])
-            self.samples[sample_id] = frame
-            ids.append(sample_id)
-            count += 1
+            last_id = ids[-1]
+            while frame_count < self.clip_length:
+                ids.append(last_id)
+                frame_count += 1
 
-            if video_id not in self.video_name_to_idx:
-                self.video_name_to_idx[video_id] = len(self.video_name_to_idx) + 1
-
-        self._finalize_video(ids, count)
         return ids
 
-    def _finalize_video(self, ids: List[str], count: int) -> int:
-        if count == 0 or not ids:
-            return 0
-        last_id = ids[-1]
-        while count < self.clip_length:
-            ids.append(last_id)
-            count += 1
-        return 0
-
     @staticmethod
-    def _parse_maskvd_filename(file_name: str) -> Tuple[str, str]:
+    def _parse_filename(file_name: str) -> Tuple[str, str]:
         stem = Path(file_name).stem
         video_id, frame_number = stem.split("_")[-2:]
         return video_id, frame_number
+
+    @staticmethod
+    def _aspect_ratio(sample: Dict) -> float:
+        height = sample.get("height", 1)
+        width = sample.get("width", 1)
+        return width / height if height else 1.0
 
     @staticmethod
     def convert_to_xyxy(boxes):
@@ -152,38 +205,6 @@ class MaskVDVIDDataset(GeneralizedDataset):
     def _is_valid_frame(self, frame: Dict) -> bool:
         return len(frame["labels"]) == 1
 
-    def _locate_split_name(self, split: str) -> str:
-        candidates = []
-        if split in SPLIT_ALIASES:
-            candidates.append(SPLIT_ALIASES[split])
-        candidates.append(split)
-
-        for cand in dict.fromkeys(candidates):  # preserve order, drop duplicates
-            ann_file = self.data_dir / cand / "labels.json"
-            if ann_file.exists():
-                return cand
-
-        available = ", ".join(self._list_splits())
-        raise FileNotFoundError(
-            f"Cannot find split directory for '{split}'. "
-            f"Tried {candidates}. Available splits: {available}"
-        )
-
-    def _list_splits(self) -> List[str]:
-        splits = []
-        if not self.data_dir.exists():
-            return splits
-        for child in self.data_dir.iterdir():
-            if child.is_dir():
-                splits.append(child.name)
-        return splits
-
-    @staticmethod
-    def _aspect_ratio(sample: Dict) -> float:
-        height = sample.get("height", 1)
-        width = sample.get("width", 1)
-        return width / height if height else 1.0
-
     def get_image(self, img_id):
         sample = self.samples[str(int(img_id))]
         image = Image.open(sample["path"])
@@ -194,11 +215,7 @@ class MaskVDVIDDataset(GeneralizedDataset):
 
         boxes = torch.tensor(sample["boxes"], dtype=torch.float32)
         boxes = self.convert_to_xyxy(boxes)
-
-        labels = torch.tensor(
-            [self.label_mapping[label] for label in sample["labels"]],
-            dtype=torch.int64,
-        )
+        labels = torch.tensor(sample["labels"], dtype=torch.int64)
 
         video_idx = self.video_name_to_idx.setdefault(
             sample["video_id"], len(self.video_name_to_idx) + 1
@@ -213,5 +230,4 @@ class MaskVDVIDDataset(GeneralizedDataset):
             masks=None,
         )
         return target
-
 
