@@ -43,6 +43,17 @@ CLASSES = (
 COCO_CATEGORY_IDS = tuple(range(1, len(CLASSES) + 1))
 
 
+SPLIT_MAPPING = {
+    "train": "vid_train",
+    "val": "vid_val",
+    "test": "vid_val",
+    "vid_train": "vid_train",
+    "vid_val": "vid_val",
+    "vid_minival": "vid_minival",
+    "det_train": "det_train",
+}
+
+
 class MaskVDVIDDataset(GeneralizedDataset):
     """
     Read ImageNet-VID data that has been reorganized following MaskVD's `vid_data.tar`
@@ -54,11 +65,12 @@ class MaskVDVIDDataset(GeneralizedDataset):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.split = split
+        self.maskvd_split = SPLIT_MAPPING.get(split, split)
         self.train = train
         self.clip_length = clip_length
 
-        self.frames_dir = self.data_dir / split / "frames"
-        self.ann_file = self.data_dir / split / "labels.json"
+        self.frames_dir = self.data_dir / self.maskvd_split / "frames"
+        self.ann_file = self.data_dir / self.maskvd_split / "labels.json"
         if not self.frames_dir.exists():
             raise FileNotFoundError(f"Frames directory not found: {self.frames_dir}")
         if not self.ann_file.exists():
